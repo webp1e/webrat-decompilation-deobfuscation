@@ -130,7 +130,7 @@ main.GetGeckoMasterKey
 main.DecryptGecko
 ```
 
-Кража яндекс и других:
+Кража яндекс:
 
 ```
 main.getYandexLogins
